@@ -1,5 +1,15 @@
 """
-精确的 Pitch 漂移仿真 v3
+Pitch 漂移仿真脚本 (Pitch Drift Simulation)
+
+本脚本使用精确的 3D 几何模型，仿真在 A 柱相机视角下，
+当驾驶员真实 Pitch 保持不变、仅改变 Yaw 时，
+模型预测的 Pitch 出现系统性漂移的现象，并验证透视矫正的效果。
+
+运行方式：
+    python pitch_drift_sim.py
+    python pitch_drift_sim.py --cam_yaw 35 --cam_pitch -15 --true_pitch 5
+
+精确的 Pitch 漂移仿真
 核心思路：
   - 真实世界中，驾驶员头部姿态由旋转矩阵 R_head 描述（相对于相机坐标系）
   - 当相机从 A 柱侧视时，R_head 包含了相机安装偏置 + 真实头部姿态
@@ -8,27 +18,38 @@
   - 矫正后，我们先乘以 R_cam_inv，把相机偏置剥离，再提取真实 Pitch
 """
 
+import argparse
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-plt.rcParams['font.sans-serif'] = ['WenQuanYi Zen Hei', 'DejaVu Sans']
+plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'WenQuanYi Zen Hei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 # ─────────────────────────────────────────────
+# 命令行参数
+# ─────────────────────────────────────────────
+parser = argparse.ArgumentParser(description='Pitch Drift Simulation for A-Pillar Camera')
+parser.add_argument('--cam_yaw',    type=float, default=30.0,  help='相机安装偏置 Yaw 角（度），默认 30°')
+parser.add_argument('--cam_pitch',  type=float, default=-10.0, help='相机安装偏置 Pitch 角（度），默认 -10°')
+parser.add_argument('--true_pitch', type=float, default=5.0,   help='驾驶员真实 Pitch 角（度，固定），默认 5°')
+parser.add_argument('--output',     type=str,   default='pitch_drift_result.png', help='输出图像路径')
+args = parser.parse_args()
+
+# ─────────────────────────────────────────────
 # 场景参数
 # ─────────────────────────────────────────────
 # 相机安装参数（A 柱侧视）
-CAM_YAW_DEG   =  30.0   # 相机向左偏置 30°（从驾驶员视角看，相机在左前方）
-CAM_PITCH_DEG = -10.0   # 相机俯视 10°
+CAM_YAW_DEG   = args.cam_yaw    # 相机向左偏置（从驾驶员视角看，相机在左前方）
+CAM_PITCH_DEG = args.cam_pitch  # 相机俯视角
 
 # 相机安装旋转矩阵：描述相机坐标系相对于"驾驶员正前方"坐标系的旋转
 R_cam = Rotation.from_euler('YX', [CAM_YAW_DEG, CAM_PITCH_DEG], degrees=True).as_matrix()
 R_cam_inv = R_cam.T  # 正交矩阵的逆 = 转置
 
-TRUE_PITCH = 5.0   # 驾驶员真实 Pitch（固定）
+TRUE_PITCH = args.true_pitch  # 驾驶员真实 Pitch（固定）
 
 yaw_angles = np.linspace(-45, 45, 181)
 pitch_naive_list     = []
@@ -148,7 +169,7 @@ fig.suptitle(
 )
 
 plt.tight_layout()
-out = "/home/ubuntu/head_pose_research/pitch_drift_simulation_v3.png"
+out = args.output
 plt.savefig(out, dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
 plt.close()
 print(f"\n仿真图已保存至: {out}")
