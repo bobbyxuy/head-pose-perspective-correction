@@ -304,6 +304,8 @@ def main():
                         help="MediaPipe face_landmarker.task 模型路径")
     parser.add_argument("--output",       type=str, default="rectify_result.png",
                         help="输出可视化图像路径")
+    parser.add_argument("--save_rectified", action="store_true",
+                        help="单独保存矫正后的完整图（rectified_full.png）和 crop 对比图（crop_compare.png）")
     args = parser.parse_args()
 
     # ── 读取图像 ──
@@ -448,6 +450,34 @@ def main():
     plt.savefig(args.output, dpi=150, bbox_inches='tight',
                 facecolor=fig.get_facecolor())
     plt.close()
+
+    # ── 单独保存矫正后完整图和 crop 对比图（均为无标注干净图） ──
+    out_dir = os.path.dirname(os.path.abspath(args.output))
+
+    # 1. 矫正后完整图（无标注）
+    rectified_full_path = os.path.join(out_dir, "rectified_full.png")
+    cv2.imwrite(rectified_full_path, cv2.cvtColor(rectified, cv2.COLOR_RGB2BGR))
+    print(f"矫正后完整图已保存: {rectified_full_path}")
+
+    # 2. crop 对比图（左：原始裁剪，右：矫正后裁剪，中间白线分隔，均无标注）
+    if face_orig_crop.size > 0 and face_rect_crop.size > 0:
+        # 统一高度
+        target_h = max(face_orig_crop.shape[0], face_rect_crop.shape[0])
+        def pad_to_height(img_arr, th):
+            dh = th - img_arr.shape[0]
+            if dh > 0:
+                pad = np.zeros((dh, img_arr.shape[1], 3), dtype=np.uint8)
+                return np.vstack([img_arr, pad])
+            return img_arr
+        orig_padded = pad_to_height(face_orig_crop, target_h)
+        rect_padded = pad_to_height(face_rect_crop, target_h)
+        divider = np.full((target_h, 4, 3), 255, dtype=np.uint8)  # 白色分隔线
+        crop_compare = np.hstack([orig_padded, divider, rect_padded])
+        crop_compare_path = os.path.join(out_dir, "crop_compare.png")
+        cv2.imwrite(crop_compare_path, cv2.cvtColor(crop_compare, cv2.COLOR_RGB2BGR))
+        print(f"Crop 对比图已保存: {crop_compare_path}  (左: 原始  右: 矫正后)")
+        print(f"  原始裁剪尺寸: {face_orig_crop.shape[1]}x{face_orig_crop.shape[0]}")
+        print(f"  矫正后裁剪尺寸: {face_rect_crop.shape[1]}x{face_rect_crop.shape[0]}")
 
     print(f"\n可视化结果已保存: {args.output}")
     print(f"  人脸中心（关键点几何均值）: ({face_u:.1f}, {face_v:.1f})")
