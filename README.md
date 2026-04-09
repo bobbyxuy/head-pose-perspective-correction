@@ -18,6 +18,62 @@
 4. **姿态估计**：将矫正后的图像送入高精度模型（如 SemiUHPE）预测姿态。
 5. **姿态逆变换**：将预测出的姿态通过逆矩阵补偿回真实的相机坐标系。
 
+## 外参估计（消除 Pitch-Yaw 耦合的关键步骤）
+
+透视矫正只能解决"人脸偏离图像中心"引起的预测不一致问题。对于相机斜装导致的坐标系不对齐问题（纯 Yaw 转头时 Pitch 预测随之变化），还需要估计相机外参旋转矩阵 `R_extrinsic`，并对预测结果做坐标系补偿。
+
+### 方法 A：正视前方视频（推荐）
+
+**操作**：驾驶员坐在车内，头部保持水平正视前方，录制 10-30 秒视频。
+
+**原理**：正视前方时真实姿态 `R_world = I`，所以模型预测的 `R_camera` 就等于 `R_extrinsic`。对多帧取旋转矩阵均值（SVD 正交化）得到稳定估计。
+
+```bash
+python estimate_extrinsic.py --method A \
+    --video frontal.mp4 \
+    --output extrinsic.npy
+```
+
+### 方法 C：最小化 Pitch 方差优化（无需先验）
+
+**操作**：驾驶员做各种 Yaw 运动（左看右看），Pitch 保持不变，录制 30-60 秒视频。
+
+**原理**：正确的外参补偿后，纯 Yaw 运动时 Pitch 方差最小。通过 Nelder-Mead 优化自动搜索最优外参。
+
+```bash
+python estimate_extrinsic.py --method C \
+    --video yaw_motion.mp4 \
+    --output extrinsic.npy
+```
+
+### 验证外参效果
+
+```bash
+python estimate_extrinsic.py --verify \
+    --video driving.mp4 \
+    --extrinsic extrinsic.npy
+# 输出 extrinsic_verify.png：补偿前后 Pitch 曲线对比
+# 补偿后 Pitch std 应明显小于补偿前
+```
+
+### 在代码中使用外参
+
+```python
+import numpy as np
+from estimate_extrinsic import compensate_extrinsic
+
+# 加载外参（只需一次）
+R_extrinsic = np.load('extrinsic.npy')
+
+# 对每个模型预测结果做补偿
+yaw_world, pitch_world, roll_world = compensate_extrinsic(
+    yaw_camera, pitch_camera, roll_camera, R_extrinsic
+)
+# pitch_world 在驾驶员纯 Yaw 转头时保持稳定
+```
+
+> **重要**：补偿必须在旋转矩阵空间完成（`R_world = R_extrinsic @ R_camera`），不能直接对欧拉角做加减，否则会引入耦合误差。
+
 ## 依赖安装
 
 推荐使用 Python 3.8+ 环境。
