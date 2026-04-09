@@ -26,11 +26,14 @@
 # 基础依赖
 pip install numpy opencv-python scipy matplotlib
 
-# 人脸检测模型 (InsightFace RetinaFace)
-pip install insightface onnxruntime-gpu
+# 人脸检测 + 关键点（MediaPipe FaceLandmarker）
+pip install mediapipe
 
-# 单图相机内参估计模型 (GeoCalib ECCV 2024)
+# 可选：单图相机内参估计（GeoCalib ECCV 2024，比启发式猜测更准确）
 pip install -e "git+https://github.com/cvg/GeoCalib#egg=geocalib"
+
+# 可选：PyTorch（运行 SemiUHPE 伪标签生成管线）
+pip install torch torchvision
 ```
 
 ## 预训练模型下载
@@ -50,7 +53,7 @@ pip install -e "git+https://github.com/cvg/GeoCalib#egg=geocalib"
 
 本项目提供两个测试脚本，帮助您验证透视矫正的效果：
 
-1. `rectify_demo.py`：对单张图像进行透视矫正，可视化矫正前后的人脸形变差异。
+1. `rectify_demo.py`：使用 **MediaPipe FaceLandmarker** 检测人脸关键点，以关键点几何中心作为人脸中心，对单张图像进行透视矫正，可视化矫正前后的人脸形变差异。
 2. `pitch_drift_sim.py`：使用精确的 3D 几何模型，仿真在 A 柱视角下，Pitch 随 Yaw 漂移的现象，并验证透视矫正能否彻底消除该漂移。
 
 ## 使用方法
@@ -65,7 +68,13 @@ python rectify_demo.py --image path/to/your/image.jpg --focal_length 1000
 
 *参数说明：*
 - `--image`: 输入图像路径。
-- `--focal_length`: 相机焦距（可选）。如果未提供，脚本将使用图像宽度作为默认焦距。在实际应用中，强烈建议使用标定得到的准确焦距或通过 GeoCalib 估计。
+- `--focal_length`: 相机焦距（像素，可选）。如果未提供，脚本将启发式猜测 FOV=60°。在实际应用中，强烈建议使用标定得到的准确焦距或通过 GeoCalib 估计。
+- `--model_path`: MediaPipe `face_landmarker.task` 模型路径（默认 `face_landmarker.task`，首次运行时会自动下载）。
+- `--output`: 输出可视化图像路径（默认 `rectify_result.png`）。
+
+**关于人脸中心的计算方式：**
+
+本脚本使用 MediaPipe FaceLandmarker 的 478 个 3D 面部关键点，取面部轮廓、鼻梁、眼眶等关键点子集的 2D 投影坐标几何均值作为人脸中心。相比纯 BBox 中点，该中心更接近面部真实几何中心，对侧脸和遮挡情况更鲁棒。
 
 ### 2. Pitch 漂移仿真测试
 
@@ -76,6 +85,27 @@ python pitch_drift_sim.py
 ```
 
 该脚本模拟相机安装在偏置角 30°（Yaw）和 10°（Pitch）的位置，驾驶员真实 Pitch 保持 5° 不变，Yaw 在 `[-45°, 45°]` 之间变化。输出图表将直观展示未矫正时的严重漂移以及矫正后的稳定效果。
+
+### 3. 完整伪标签生成管线
+
+```bash
+# 克隆 SemiUHPE 并下载权重后运行
+python pseudolabel_pipeline.py \
+    --image_dir ./your_images \
+    --output_dir ./pseudo_labels \
+    --semiuhpe_root ./SemiUHPE \
+    --weight_path ./SemiUHPE/weights/DAD-WildHead-EffNetV2-S-best.pth \
+    --save_vis
+```
+
+*参数说明：*
+- `--image_dir`: 输入图像目录。
+- `--output_dir`: 伪标签 JSON 输出目录。
+- `--focal_length`: 相机焦距（像素，可选，不提供则自动估计）。
+- `--intrinsics_method`: 内参估计方法，`heuristic`（默认）或 `geocalib`。
+- `--semiuhpe_root`: SemiUHPE 代码库根目录（不提供则仅执行检测和矫正步骤）。
+- `--weight_path`: SemiUHPE 权重文件路径。
+- `--save_vis`: 保存可视化图像（含关键点中心和偏置角标注）。
 
 ## 注意事项
 
