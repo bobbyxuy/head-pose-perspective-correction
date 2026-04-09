@@ -3,7 +3,12 @@ opencv-python>=4.5.0
 scipy>=1.7.0
 matplotlib>=3.4.0
 mediapipe>=0.10.0
-# 可选：GeoCalib（深度学习内参估计，比启发式猜测更准确）
-# pip install -e "git+https://github.com/cvg/GeoCalib#egg=geocalib"
-# 可选：PyTorch（运行 SemiUHPE 伪标签生成管线）
+
+# ── 可选：GeoCalib（深度学习内参估计，比启发式猜测更准确）──
+# 注意：GeoCalib 不在 PyPI，需要从源码安装：
+#   git clone https://github.com/cvg/GeoCalib.git
+#   pip install -e ./GeoCalib
+# 安装后在脚本中使用 --intrinsics geocalib 参数启用
+
+# ── 可选：PyTorch（运行 SemiUHPE 伪标签生成管线）──
 # pip install torch torchvision

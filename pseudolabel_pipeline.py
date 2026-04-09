@@ -50,14 +50,19 @@ def euler_to_rotation_matrix(pitch, yaw, roll=0.0, convention='YXZ'):
 
 def compute_rectification_homography(face_u, face_v, K):
     """
-    计算透视矫正单应性矩阵。
+    计算透视矫正单应性矩阵（使用 Rodrigues 轴角旋转，无欧拉角耦合误差）。
 
-    原理：
-        人脸中心 (face_u, face_v) 偏离图像光轴中心 (cx, cy)，
-        说明相机光轴未对准人脸，存在透视偏置。
-        构造矫正旋转矩阵 R_rectify，将相机"虚拟地旋转"使光轴对准人脸，
-        消除透视偏置引起的 Pitch/Yaw 漂移。
-        H = K @ R_rectify @ K^{-1}
+    推导：
+        H = K @ R @ K^{-1}
+        要求 H @ [face_u, face_v, 1]^T ≈ [cx, cy, 1]^T
+        等价于 R @ d = [0, 0, 1]^T，其中 d = K^{-1} @ [face_u, face_v, 1]^T
+
+        使用 Rodrigues 旋转将 d 旋转到光轴方向 z=[0,0,1]：
+            axis = d × z / |d × z|
+            angle = arccos(d · z)
+            R = I + sin(angle)*[axis]× + (1-cos(angle))*[axis]×²
+
+        此方法对任意偏置角均精确，无欧拉角分解的耦合误差。
 
     Args:
         face_u (float): 人脸中心 u 坐标（像素），由关键点几何中心计算
@@ -67,25 +72,42 @@ def compute_rectification_homography(face_u, face_v, K):
     Returns:
         H (np.ndarray): 3x3 透视矫正单应性矩阵
         R_rectify (np.ndarray): 3x3 矫正旋转矩阵（用于后续姿态逆变换）
-        yaw_bias_deg (float): 偏置 Yaw 角（度）
-        pitch_bias_deg (float): 偏置 Pitch 角（度）
+        yaw_bias_deg (float): 偏置 Yaw 角（度，仅用于显示）
+        pitch_bias_deg (float): 偏置 Pitch 角（度，仅用于显示）
     """
     cx, cy = K[0, 2], K[1, 2]
     fx, fy = K[0, 0], K[1, 1]
-
-    dx = face_u - cx
-    dy = face_v - cy
-
-    # 偏置角：人脸中心偏离光轴的角度
-    yaw_bias_deg   = np.degrees(np.arctan2(dx, fx))
-    pitch_bias_deg = np.degrees(np.arctan2(dy, fy))
-
-    # 矫正旋转矩阵：将相机旋转对准人脸（消除偏置）
-    R_rectify = euler_to_rotation_matrix(-pitch_bias_deg, -yaw_bias_deg)
-
-    # 单应性矩阵
     K_inv = np.linalg.inv(K)
+
+    # 人脸方向向量（相机坐标系中的 3D 方向）
+    d = K_inv @ np.array([face_u, face_v, 1.0])
+    d = d / np.linalg.norm(d)
+
+    # 目标方向：光轴 z
+    z = np.array([0.0, 0.0, 1.0])
+
+    # Rodrigues 旋转：将 d 旋转到 z
+    axis = np.cross(d, z)
+    axis_norm = np.linalg.norm(axis)
+
+    if axis_norm < 1e-6:
+        R_rectify = np.eye(3)
+    else:
+        axis = axis / axis_norm
+        angle = np.arccos(np.clip(np.dot(d, z), -1.0, 1.0))
+        K_mat = np.array([
+            [0,       -axis[2],  axis[1]],
+            [axis[2],  0,       -axis[0]],
+            [-axis[1], axis[0],  0      ]
+        ])
+        R_rectify = (np.eye(3) + np.sin(angle) * K_mat
+                     + (1 - np.cos(angle)) * (K_mat @ K_mat))
+
     H = K @ R_rectify @ K_inv
+
+    # 偏置角（仅用于显示）
+    yaw_bias_deg   = np.degrees(np.arctan2(face_u - cx, fx))
+    pitch_bias_deg = np.degrees(np.arctan2(face_v - cy, fy))
 
     return H, R_rectify, yaw_bias_deg, pitch_bias_deg
 
@@ -182,14 +204,21 @@ def estimate_intrinsics(img, method='heuristic', focal_length=None):
             from geocalib import GeoCalib
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
             model = GeoCalib().to(device)
+            model.eval()
             img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
             img_t = img_t.unsqueeze(0).to(device)
             with torch.no_grad():
-                result = model(img_t)
+                result = model.calibrate(img_t)
+            # result['camera'].f 是归一化焦距（相对于 max(H,W)）
             f = result['camera'].f.item() * max(w, h)
             print(f"[内参] GeoCalib 估计: f={f:.1f}px")
         except ImportError:
             print("[警告] GeoCalib 未安装，回退到启发式猜测")
+            print("  安装方式: git clone https://github.com/cvg/GeoCalib.git && pip install -e ./GeoCalib")
+            fov_deg = 60.0
+            f = (w / 2.0) / np.tan(np.radians(fov_deg / 2.0))
+        except Exception as e:
+            print(f"[警告] GeoCalib 估计失败: {e}，回退到启发式猜测")
             fov_deg = 60.0
             f = (w / 2.0) / np.tan(np.radians(fov_deg / 2.0))
 
