@@ -8,17 +8,25 @@ calibrate_from_frontal.py
   只有 A 柱相机视角下驾驶员正视前方的图片，没有视频，没有转头数据。
 
 【核心原理】
-  当驾驶员正视前方时，定义此时头部姿态为世界坐标系零点（R_world = I）。
-  此时模型预测的 R_camera 就等于相机外参 R_extrinsic。
+  当驾驶员正视前方时，定义此时头部姿态为世界坐标系零点。
+  此时模型预测的 R_pred = R_extrinsic（相机安装旋转矩阵）。
   估计出 R_extrinsic 后，对任意帧的预测结果做：
-      R_world = R_extrinsic @ R_camera
-  从 R_world 提取的欧拉角即为世界坐标系下的真实姿态，
-  纯 Yaw 转头时 Pitch 将保持稳定。
 
-【SemiUHPE 欧拉角约定】
-  - 网络输出 9 维向量，经 SVD 正交化得到旋转矩阵 R（3x3）
-  - 从 R 提取欧拉角顺序为 (pitch, yaw, roll)，单位：度（XYZ 旋转顺序）
-  - 本脚本内部统一使用旋转矩阵做运算，不依赖欧拉角加减
+      R_world = R_extrinsic.T @ R_pred
+
+  注意：使用转置（旋转矩阵的逆），而不是直接相乘。
+  原因：R_pred 描述"将标准正脸旋转到当前头部姿态（在相机坐标系中）"，
+  R_extrinsic.T 将其从相机坐标系变换回世界坐标系。
+
+【SemiUHPE DAD3DHeads 欧拉角约定】
+  官方 predict.py 中的转换（train_labeled == "DAD3DHeads"）：
+      rot_mat_2 = np.transpose(rot_mat)
+      angle = Rotation.from_matrix(rot_mat_2).as_euler("xyz", degrees=True)
+      roll, pitch, yaw = angle[2], angle[0] - 180, angle[1]
+
+  重要：在此约定下，正视前方（世界 pitch=0°）对应的 rot_mat 使得提取出的
+  pitch ≈ ±180°，而不是 0°。本脚本在输出时自动做 ±180° 偏移修正，
+  使得正视前方显示为 pitch=0°，符合直觉。
 
 【快速开始】
   # 0. 安装依赖
@@ -34,14 +42,16 @@ calibrate_from_frontal.py
   python calibrate_from_frontal.py --mode calibrate \
       --images frontal1.jpg frontal2.jpg frontal3.jpg \
       --semiuhpe_root ./SemiUHPE \
-      --weights weights/DAD-COCOHead-ResNet50-best.pth \
+      --weights weights/DAD-COCOHead-EffNetV2-S-best.pth \
+      --network effinetv2 \
       --output extrinsic.npy
 
-  # 4. 验证补偿效果
+  # 4. 验证补偿效果（补偿后 Pitch 应接近 0°，Yaw 应反映实际转头角度）
   python calibrate_from_frontal.py --mode verify \
       --images look_left.jpg look_right.jpg \
       --semiuhpe_root ./SemiUHPE \
-      --weights weights/DAD-COCOHead-ResNet50-best.pth \
+      --weights weights/DAD-COCOHead-EffNetV2-S-best.pth \
+      --network effinetv2 \
       --extrinsic extrinsic.npy
 
   # 5. 批量补偿伪标签 CSV
@@ -54,7 +64,6 @@ calibrate_from_frontal.py
 import argparse
 import os
 import sys
-import math
 import numpy as np
 import cv2
 from scipy.spatial.transform import Rotation
@@ -67,6 +76,88 @@ try:
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
+
+
+# =============================================================================
+# SemiUHPE DAD3DHeads 欧拉角约定（完整复现官方 predict.py）
+# =============================================================================
+
+def _limit_angle(angle, pi=180.0):
+    """将角度限制在 [-pi, pi] 范围内（来自 SemiUHPE src/utils.py）"""
+    if angle < -pi:
+        k = -2 * (int(angle / pi) // 2)
+        angle = angle + k * pi
+    if angle > pi:
+        k = 2 * ((int(angle / pi) + 1) // 2)
+        angle = angle - k * pi
+    return angle
+
+
+def rotmat_to_euler_raw(rot_mat):
+    """
+    从 SemiUHPE 旋转矩阵提取原始欧拉角（官方 predict.py DAD3DHeads 分支）。
+
+    官方代码：
+        rot_mat_2 = np.transpose(rot_mat)
+        angle = Rotation.from_matrix(rot_mat_2).as_euler("xyz", degrees=True)
+        roll, pitch, yaw = angle[2], angle[0]-180, angle[1]
+
+    返回：(pitch_raw, yaw, roll)，其中 pitch_raw 在正视前方时约为 ±180°。
+    """
+    rot_mat_2 = np.transpose(rot_mat)
+    angle = Rotation.from_matrix(rot_mat_2).as_euler("xyz", degrees=True)
+    pitch_raw = _limit_angle(angle[0] - 180)
+    yaw       = _limit_angle(angle[1])
+    roll      = _limit_angle(angle[2])
+    return pitch_raw, yaw, roll
+
+
+def normalize_pitch(pitch_raw):
+    """
+    将 DAD3D 约定的原始 Pitch 转换为直觉俯仰角（正视前方=0°）。
+
+    在 DAD3D 约定下，正视前方对应 pitch_raw ≈ ±180°。
+    本函数将其偏移 ±180°，使正视前方显示为 0°。
+    """
+    if pitch_raw > 90:
+        return pitch_raw - 180.0
+    elif pitch_raw < -90:
+        return pitch_raw + 180.0
+    return pitch_raw
+
+
+def rotmat_to_euler(rot_mat):
+    """
+    从 SemiUHPE 旋转矩阵提取欧拉角（度），输出直觉俯仰角。
+
+    返回：(pitch, yaw, roll)
+        pitch : 俯仰角，正视前方=0°，低头为负，抬头为正
+        yaw   : 偏航角，正视前方=0°，右转为正，左转为负
+        roll  : 滚转角，正视前方=0°
+    """
+    pitch_raw, yaw, roll = rotmat_to_euler_raw(rot_mat)
+    return normalize_pitch(pitch_raw), yaw, roll
+
+
+def euler_to_rotmat(pitch, yaw, roll):
+    """
+    将直觉欧拉角（度）还原为 SemiUHPE 旋转矩阵（DAD3D 约定的逆向）。
+
+    参数：
+        pitch : 俯仰角（正视前方=0°）
+        yaw   : 偏航角
+        roll  : 滚转角
+
+    返回：rot_mat（3x3 numpy array）
+    """
+    # 逆向：pitch_raw = pitch + 180（如果 pitch <= 0）或 pitch - 180（如果 pitch > 0）
+    # 等价于：pitch_raw = normalize_pitch 的逆运算
+    if pitch > 0:
+        pitch_raw = pitch - 180.0
+    else:
+        pitch_raw = pitch + 180.0
+    rot_mat_2 = Rotation.from_euler('xyz', [pitch_raw + 180, yaw, roll], degrees=True).as_matrix()
+    return rot_mat_2.T
 
 
 # =============================================================================
@@ -85,30 +176,29 @@ def setup_semiuhpe_path(semiuhpe_root):
         sys.path.insert(0, semiuhpe_root)
 
 
-def load_semiuhpe_model(semiuhpe_root, weights_path, network='resnet50', device=None):
+def load_semiuhpe_model(semiuhpe_root, weights_path, network='effinetv2', device=None):
     """
     加载 SemiUHPE 预训练模型。
 
     参数:
         semiuhpe_root : SemiUHPE 仓库根目录路径
         weights_path  : 权重文件路径（相对于 semiuhpe_root 或绝对路径）
-        network       : 骨干网络，可选 'resnet50'（默认）、'effinetv2'、'repvgg'
+        network       : 骨干网络，可选 'effinetv2'（默认）、'resnet50'、'repvgg'
         device        : 'cuda' 或 'cpu'，None 时自动选择
 
     返回:
         (net, device) : 模型对象和设备字符串
 
     可用预训练权重（来源：https://huggingface.co/HoyerChou/SemiUHPE）:
-        DAD-COCOHead-ResNet50-best.pth    395 MB  -- 推荐，精度与速度均衡
-        DAD-COCOHead-EffNetV2-S-best.pth  336 MB
-        DAD-WildHead-EffNetV2-S-best.pth  336 MB  -- 野外场景更强
-        DAD-COCOHead-RepVGG-best.pth      719 MB
+        DAD-COCOHead-EffNetV2-S-best.pth  336 MB  -- 推荐（--network effinetv2）
+        DAD-WildHead-EffNetV2-S-best.pth  336 MB  -- 野外场景更强（--network effinetv2）
+        DAD-COCOHead-ResNet50-best.pth    395 MB  -- (--network resnet50)
+        DAD-COCOHead-RepVGG-best.pth      719 MB  -- (--network repvgg)
     """
     import torch
 
     setup_semiuhpe_path(semiuhpe_root)
 
-    # 解析权重路径
     if not os.path.isabs(weights_path):
         weights_path = os.path.join(semiuhpe_root, weights_path)
     if not os.path.exists(weights_path):
@@ -117,12 +207,10 @@ def load_semiuhpe_model(semiuhpe_root, weights_path, network='resnet50', device=
             "请先运行: python calibrate_from_frontal.py --mode download_weights"
         )
 
-    # 自动选择设备
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"[模型] 使用设备: {device}")
 
-    # 构造最小 config 对象（避免触发 configargparse 的命令行解析）
     class MinimalConfig:
         num_classes = 9
 
@@ -132,17 +220,14 @@ def load_semiuhpe_model(semiuhpe_root, weights_path, network='resnet50', device=
     from src.networks import get_network
     net = get_network(config)
 
-    # 加载权重
     ckpt = torch.load(weights_path, map_location=device)
-    # SemiUHPE checkpoint 结构：{'net': ..., 'ema_net': ..., 'clock': ..., ...}
     if isinstance(ckpt, dict) and 'ema_net' in ckpt:
-        state_dict = ckpt['ema_net']   # 优先使用 EMA 权重（更稳定）
+        state_dict = ckpt['ema_net']
     elif isinstance(ckpt, dict) and 'net' in ckpt:
         state_dict = ckpt['net']
     else:
         state_dict = ckpt
 
-    # 处理 DataParallel 前缀
     new_state_dict = {}
     for k, v in state_dict.items():
         new_state_dict[k.replace('module.', '')] = v
@@ -157,7 +242,7 @@ def load_semiuhpe_model(semiuhpe_root, weights_path, network='resnet50', device=
 
 def predict_rotation_matrix(img_bgr, net, device):
     """
-    对单张裁剪好的头部图片做推理，返回旋转矩阵 R（3x3 numpy array）。
+    对单张裁剪好的头部图片做推理，返回旋转矩阵 rot_mat（3x3 numpy array）。
 
     参数:
         img_bgr : BGR 格式 numpy 图像（已裁剪为头部区域，任意分辨率）
@@ -165,7 +250,7 @@ def predict_rotation_matrix(img_bgr, net, device):
         device  : 'cuda' 或 'cpu'
 
     返回:
-        R : 3x3 旋转矩阵（numpy array）
+        rot_mat : 3x3 旋转矩阵（与官方 predict.py 中的 rot_mat 一致）
 
     内部流程（与 SemiUHPE predict.py 一致）:
         1. BGR -> RGB -> PIL -> resize(224,224)
@@ -183,48 +268,15 @@ def predict_rotation_matrix(img_bgr, net, device):
     img_tensor = tfs.ToTensor()(img_pil)
     img_tensor = tfs.Normalize([0.485, 0.456, 0.406],
                                 [0.229, 0.224, 0.225])(img_tensor)
-    img_tensor = img_tensor.unsqueeze(0)   # (1, 3, 224, 224)
+    img_tensor = img_tensor.unsqueeze(0)
     if device == 'cuda':
         img_tensor = img_tensor.cuda()
 
     with torch.no_grad():
-        fisher_out = net(img_tensor)             # (1, 9)
-        pd_m = batch_torch_A_to_R(fisher_out)   # (1, 3, 3)
+        fisher_out = net(img_tensor)
+        pd_m = batch_torch_A_to_R(fisher_out)
 
-    return pd_m.detach().cpu().numpy()[0]        # (3, 3)
-
-
-def rotation_matrix_to_euler_semiuhpe(R, full_range=False):
-    """
-    将旋转矩阵转换为 SemiUHPE 约定的欧拉角（度）。
-
-    输出顺序：(pitch, yaw, roll)
-    旋转顺序：XYZ（x=pitch, y=yaw, z=roll）
-    来源：src/utils.py::rot_euler_6DRepNet（SemiUHPE 官方实现）
-
-    参数:
-        R          : 3x3 旋转矩阵（numpy array）
-        full_range : True 时 Yaw 范围扩展到 (-180, 180)，默认 False 即 (-90, 90)
-
-    返回:
-        (pitch, yaw, roll) : 欧拉角（度）
-    """
-    sy = math.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
-    singular = sy < 1e-6
-
-    if R[0, 0] < 0 and full_range:
-        sy = -sy
-
-    if not singular:
-        x = math.atan2(R[2, 1], R[2, 2])
-        y = math.atan2(-R[2, 0], sy)
-        z = math.atan2(R[1, 0], R[0, 0])
-    else:
-        x = math.atan2(-R[1, 2], R[1, 1])
-        y = math.atan2(-R[2, 0], sy)
-        z = 0.0
-
-    return math.degrees(x), math.degrees(y), math.degrees(z)
+    return pd_m.detach().cpu().numpy()[0]
 
 
 # =============================================================================
@@ -248,51 +300,58 @@ def average_rotation_matrices(R_list):
     return R_mean
 
 
-def compensate_extrinsic_R(R_camera, R_extrinsic):
+def compensate_rotmat(R_pred, R_extrinsic):
     """
-    将相机坐标系旋转矩阵补偿到世界坐标系。
+    将模型预测的旋转矩阵从相机坐标系补偿到世界坐标系。
 
-    公式：R_world = R_extrinsic @ R_camera
+    公式：R_world = R_extrinsic.T @ R_pred
+
+    推导：
+        R_pred = R_extrinsic @ R_world_head（相机坐标系中的头部旋转）
+        R_world_head = R_extrinsic.T @ R_pred（逆变换还原世界坐标系）
+
+        验证：正视前方时 R_pred = R_extrinsic，
+              R_world_head = R_extrinsic.T @ R_extrinsic = I（单位矩阵）
+              从 I 提取欧拉角 -> pitch=0°, yaw=0°, roll=0° ✓
 
     参数:
-        R_camera    : 模型预测的旋转矩阵（3x3 numpy array）
-        R_extrinsic : 外参旋转矩阵（3x3 numpy array）
+        R_pred      : 模型预测的旋转矩阵（3x3 numpy array）
+        R_extrinsic : 外参旋转矩阵（3x3 numpy array，由 calibrate 模式生成）
 
     返回:
         R_world : 世界坐标系旋转矩阵（3x3 numpy array）
     """
-    return R_extrinsic @ R_camera
+    return R_extrinsic.T @ R_pred
 
 
-def compensate_extrinsic_euler(pitch, yaw, roll, R_extrinsic, full_range=False):
+def compensate_euler(pitch, yaw, roll, R_extrinsic):
     """
-    将 SemiUHPE 输出的欧拉角（pitch, yaw, roll，度）补偿到世界坐标系。
+    将 SemiUHPE 输出的欧拉角（度）补偿到世界坐标系。
 
     参数:
-        pitch, yaw, roll : SemiUHPE 预测的欧拉角（度），XYZ 顺序
+        pitch, yaw, roll : SemiUHPE 预测的欧拉角（度），已经过 normalize_pitch 处理
         R_extrinsic      : 外参旋转矩阵（3x3 numpy array）
-        full_range       : 是否使用全角度范围
 
     返回:
         (pitch_world, yaw_world, roll_world) : 世界坐标系欧拉角（度）
     """
-    R_camera = Rotation.from_euler('xyz', [pitch, yaw, roll], degrees=True).as_matrix()
-    R_world = compensate_extrinsic_R(R_camera, R_extrinsic)
-    return rotation_matrix_to_euler_semiuhpe(R_world, full_range)
+    R_pred = euler_to_rotmat(pitch, yaw, roll)
+    R_world = compensate_rotmat(R_pred, R_extrinsic)
+    return rotmat_to_euler(R_world)
 
 
 # =============================================================================
 # Step 0：下载预训练权重
 # =============================================================================
 
-def download_weights(semiuhpe_root, model_name='DAD-COCOHead-ResNet50-best.pth'):
+def download_weights(semiuhpe_root, model_name='DAD-COCOHead-EffNetV2-S-best.pth'):
     """
     从 HuggingFace (HoyerChou/SemiUHPE) 下载预训练权重到 semiuhpe_root/weights/ 目录。
 
     可用模型：
-        DAD-COCOHead-ResNet50-best.pth    395 MB  -- 推荐（--network resnet50）
-        DAD-COCOHead-EffNetV2-S-best.pth  336 MB  -- (--network effinetv2)
-        DAD-WildHead-EffNetV2-S-best.pth  336 MB  -- 野外场景更强 (--network effinetv2)
+        DAD-COCOHead-EffNetV2-S-best.pth  336 MB  -- 推荐（--network effinetv2）
+        DAD-WildHead-EffNetV2-S-best.pth  336 MB  -- 野外场景更强（--network effinetv2）
+        DAD-COCOHead-ResNet50-best.pth    395 MB  -- (--network resnet50)
         DAD-COCOHead-RepVGG-best.pth      719 MB  -- (--network repvgg)
     """
     try:
@@ -324,7 +383,7 @@ def download_weights(semiuhpe_root, model_name='DAD-COCOHead-ResNet50-best.pth')
 # Step 1：从正视前方图片估计外参
 # =============================================================================
 
-def calibrate(image_paths, net, device, output_path='extrinsic.npy', full_range=False):
+def calibrate(image_paths, net, device, output_path='extrinsic.npy'):
     """
     从正视前方图片估计相机外参旋转矩阵。
 
@@ -333,13 +392,12 @@ def calibrate(image_paths, net, device, output_path='extrinsic.npy', full_range=
         net         : 已加载的 SemiUHPE 模型
         device      : 'cuda' 或 'cpu'
         output_path : 外参矩阵保存路径（.npy）
-        full_range  : 是否使用全角度范围（默认 False，适合驾驶场景）
 
     返回:
         R_extrinsic : 3x3 外参旋转矩阵
 
     原理：
-        正视前方时 R_world = I，因此 R_extrinsic = R_camera。
+        正视前方时 R_world_head = I，因此 R_pred = R_extrinsic @ I = R_extrinsic。
         多张图片取 SO(3) 均值（SVD 正交化）以提高稳定性。
     """
     print(f"[Step 1] 从 {len(image_paths)} 张正视前方图片估计外参...")
@@ -352,7 +410,7 @@ def calibrate(image_paths, net, device, output_path='extrinsic.npy', full_range=
             continue
 
         R = predict_rotation_matrix(img, net, device)
-        pitch, yaw, roll = rotation_matrix_to_euler_semiuhpe(R, full_range)
+        pitch, yaw, roll = rotmat_to_euler(R)
         R_list.append(R)
         print(f"  {os.path.basename(path):35s}  "
               f"Pitch={pitch:+7.2f}  Yaw={yaw:+7.2f}  Roll={roll:+7.2f}  (deg)")
@@ -366,11 +424,11 @@ def calibrate(image_paths, net, device, output_path='extrinsic.npy', full_range=
     else:
         R_extrinsic = average_rotation_matrices(R_list)
 
-    pitch_e, yaw_e, roll_e = rotation_matrix_to_euler_semiuhpe(R_extrinsic, full_range)
+    pitch_e, yaw_e, roll_e = rotmat_to_euler(R_extrinsic)
     print(f"\n[结果] 相机安装角度估计（SO(3) 均值）:")
-    print(f"  Pitch = {pitch_e:+.2f}  (相机偏上/下)")
-    print(f"  Yaw   = {yaw_e:+.2f}  (相机偏左/右，A柱侧视预期约 +-30~45 deg)")
-    print(f"  Roll  = {roll_e:+.2f}  (相机旋转)")
+    print(f"  Pitch = {pitch_e:+.2f} deg  (相机偏上/下，正视前方时预期接近 0)")
+    print(f"  Yaw   = {yaw_e:+.2f} deg  (相机偏左/右，A柱侧视预期约 +-30~45 deg)")
+    print(f"  Roll  = {roll_e:+.2f} deg  (相机旋转，预期接近 0)")
 
     np.save(output_path, R_extrinsic)
     print(f"\n[完成] 外参矩阵已保存: {output_path}")
@@ -381,7 +439,7 @@ def calibrate(image_paths, net, device, output_path='extrinsic.npy', full_range=
 # Step 2：验证补偿效果
 # =============================================================================
 
-def verify(image_paths, net, device, R_extrinsic, full_range=False):
+def verify(image_paths, net, device, R_extrinsic):
     """
     对转头图片验证外参补偿效果。
 
@@ -394,7 +452,6 @@ def verify(image_paths, net, device, R_extrinsic, full_range=False):
         net         : 已加载的 SemiUHPE 模型
         device      : 'cuda' 或 'cpu'
         R_extrinsic : 外参旋转矩阵（由 calibrate 模式生成）
-        full_range  : 是否使用全角度范围
 
     输出:
         打印补偿前后欧拉角对比表
@@ -412,11 +469,11 @@ def verify(image_paths, net, device, R_extrinsic, full_range=False):
             print(f"  [警告] 无法读取: {path}")
             continue
 
-        R_cam = predict_rotation_matrix(img, net, device)
-        pitch, yaw, roll = rotation_matrix_to_euler_semiuhpe(R_cam, full_range)
+        R_pred = predict_rotation_matrix(img, net, device)
+        pitch, yaw, roll = rotmat_to_euler(R_pred)
 
-        R_world = compensate_extrinsic_R(R_cam, R_extrinsic)
-        pitch_w, yaw_w, roll_w = rotation_matrix_to_euler_semiuhpe(R_world, full_range)
+        R_world = compensate_rotmat(R_pred, R_extrinsic)
+        pitch_w, yaw_w, roll_w = rotmat_to_euler(R_world)
 
         name = os.path.basename(path)
         print(f"{name:<35} {pitch:>+9.2f}  {yaw:>+9.2f}  {roll:>+9.2f}"
@@ -454,7 +511,7 @@ def verify(image_paths, net, device, R_extrinsic, full_range=False):
 # Step 3：批量补偿伪标签 CSV
 # =============================================================================
 
-def compensate_csv(label_csv, R_extrinsic, output_csv, full_range=False,
+def compensate_csv(label_csv, R_extrinsic, output_csv,
                    pitch_col='pitch', yaw_col='yaw', roll_col='roll'):
     """
     批量对伪标签 CSV 文件做外参补偿。
@@ -464,13 +521,13 @@ def compensate_csv(label_csv, R_extrinsic, output_csv, full_range=False,
         img001.jpg,-8.5,12.3,1.2
         img002.jpg,-9.0,-5.1,0.8
 
-    注意：CSV 中的欧拉角应为 SemiUHPE 输出的 (pitch, yaw, roll)，单位：度。
+    注意：CSV 中的欧拉角应为 SemiUHPE 输出的 (pitch, yaw, roll)，
+    即已经过 normalize_pitch 处理的直觉俯仰角，单位：度。
 
     参数:
         label_csv   : 输入 CSV 路径
         R_extrinsic : 外参旋转矩阵（由 calibrate 模式生成）
         output_csv  : 输出 CSV 路径
-        full_range  : 是否使用全角度范围
         pitch_col   : CSV 中 pitch 列名（默认 'pitch'）
         yaw_col     : CSV 中 yaw 列名（默认 'yaw'）
         roll_col    : CSV 中 roll 列名（默认 'roll'）
@@ -495,14 +552,13 @@ def compensate_csv(label_csv, R_extrinsic, output_csv, full_range=False,
     pitch_w_list, yaw_w_list, roll_w_list = [], [], []
 
     for _, row in df.iterrows():
-        pitch_w, yaw_w, roll_w = compensate_extrinsic_euler(
-            row[pitch_col], row[yaw_col], row[roll_col], R_extrinsic, full_range
+        pitch_w, yaw_w, roll_w = compensate_euler(
+            row[pitch_col], row[yaw_col], row[roll_col], R_extrinsic
         )
         pitch_w_list.append(pitch_w)
         yaw_w_list.append(yaw_w)
         roll_w_list.append(roll_w)
 
-    # 原始列保留（加 _cam 后缀），新列为世界坐标系
     df[f'{pitch_col}_cam'] = df[pitch_col]
     df[f'{yaw_col}_cam']   = df[yaw_col]
     df[f'{roll_col}_cam']  = df[roll_col]
@@ -534,18 +590,20 @@ def main():
   python calibrate_from_frontal.py --mode download_weights \\
       --semiuhpe_root ./SemiUHPE
 
-  # 估计外参
+  # 估计外参（先重新运行 calibrate，再运行 verify）
   python calibrate_from_frontal.py --mode calibrate \\
       --images frontal1.jpg frontal2.jpg frontal3.jpg \\
       --semiuhpe_root ./SemiUHPE \\
-      --weights weights/DAD-COCOHead-ResNet50-best.pth \\
+      --weights weights/DAD-COCOHead-EffNetV2-S-best.pth \\
+      --network effinetv2 \\
       --output extrinsic.npy
 
-  # 验证补偿效果
+  # 验证补偿效果（补偿后 Pitch 应接近 0°）
   python calibrate_from_frontal.py --mode verify \\
       --images look_left.jpg look_right.jpg \\
       --semiuhpe_root ./SemiUHPE \\
-      --weights weights/DAD-COCOHead-ResNet50-best.pth \\
+      --weights weights/DAD-COCOHead-EffNetV2-S-best.pth \\
+      --network effinetv2 \\
       --extrinsic extrinsic.npy
 
   # 批量补偿伪标签 CSV
@@ -562,11 +620,11 @@ def main():
     parser.add_argument('--semiuhpe_root', default='./SemiUHPE',
                         help='SemiUHPE 仓库根目录路径（默认 ./SemiUHPE）')
     parser.add_argument('--weights',
-                        default='weights/DAD-COCOHead-ResNet50-best.pth',
+                        default='weights/DAD-COCOHead-EffNetV2-S-best.pth',
                         help='权重文件路径（相对于 semiuhpe_root 或绝对路径）')
-    parser.add_argument('--network', default='resnet50',
+    parser.add_argument('--network', default='effinetv2',
                         choices=['resnet50', 'effinetv2', 'repvgg', 'resnet18', 'mobilenet'],
-                        help='骨干网络（需与权重匹配，默认 resnet50）')
+                        help='骨干网络（需与权重匹配，默认 effinetv2）')
     parser.add_argument('--device', default=None,
                         help='推理设备（cuda/cpu，默认自动选择）')
     parser.add_argument('--images', nargs='+', default=[],
@@ -579,23 +637,19 @@ def main():
                         help='输入伪标签 CSV 路径（compensate 模式使用）')
     parser.add_argument('--output_csv', default='pseudo_labels_compensated.csv',
                         help='输出补偿后 CSV 路径（compensate 模式使用）')
-    parser.add_argument('--full_range', action='store_true',
-                        help='使用全角度范围（+-180 deg），默认 False（适合驾驶场景 +-90 deg）')
     parser.add_argument('--pitch_col', default='pitch', help='CSV 中 pitch 列名')
     parser.add_argument('--yaw_col',   default='yaw',   help='CSV 中 yaw 列名')
     parser.add_argument('--roll_col',  default='roll',  help='CSV 中 roll 列名')
     parser.add_argument('--hf_model',
-                        default='DAD-COCOHead-ResNet50-best.pth',
+                        default='DAD-COCOHead-EffNetV2-S-best.pth',
                         help='从 HuggingFace 下载的权重文件名（download_weights 模式使用）')
 
     args = parser.parse_args()
 
-    # -- download_weights 模式 --
     if args.mode == 'download_weights':
         download_weights(args.semiuhpe_root, args.hf_model)
         return
 
-    # -- 需要模型的模式（calibrate / verify）--
     if args.mode in ('calibrate', 'verify'):
         net, device = load_semiuhpe_model(
             args.semiuhpe_root, args.weights, args.network, args.device
@@ -604,7 +658,7 @@ def main():
     if args.mode == 'calibrate':
         if not args.images:
             parser.error("calibrate 模式需要提供 --images")
-        calibrate(args.images, net, device, args.output, args.full_range)
+        calibrate(args.images, net, device, args.output)
 
     elif args.mode == 'verify':
         if not args.images:
@@ -612,7 +666,7 @@ def main():
         if not os.path.exists(args.extrinsic):
             parser.error(f"外参文件不存在: {args.extrinsic}，请先运行 calibrate 模式")
         R_extrinsic = np.load(args.extrinsic)
-        verify(args.images, net, device, R_extrinsic, args.full_range)
+        verify(args.images, net, device, R_extrinsic)
 
     elif args.mode == 'compensate':
         if args.label_csv is None:
@@ -621,7 +675,6 @@ def main():
             parser.error(f"外参文件不存在: {args.extrinsic}，请先运行 calibrate 模式")
         R_extrinsic = np.load(args.extrinsic)
         compensate_csv(args.label_csv, R_extrinsic, args.output_csv,
-                       args.full_range,
                        args.pitch_col, args.yaw_col, args.roll_col)
 
 
