@@ -1,0 +1,39 @@
+%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#28407c', 'primaryTextColor': '#fff', 'primaryBorderColor': '#6699cc', 'lineColor': '#66aadd', 'secondaryColor': '#326440', 'tertiaryColor': '#824028', 'noteBkgColor': '#404060', 'noteTextColor': '#fff', 'actorBkg': '#455090', 'actorBorder': '#6699cc', 'actorTextColor': '#fff', 'signalColor': '#66aadd', 'signalTextColor': '#fff', 'sequenceNumberColor': '#000'}}}%%
+flowchart TB
+    subgraph S1["① 数据准备"]
+        S1A["输入 N 张正视前方图片<br/>建议 5~10 张，不同光照/时间"]
+    end
+
+    subgraph S2["② SemiUHPE 模型预测"]
+        S2A["每张图 → 3×3 旋转矩阵<br/>R_pred[i]"]
+        S2B["Image 1 → R_pred[0]"]
+        S2C["Image 2 → R_pred[1]"]
+        S2D["Image 3 → R_pred[2]"]
+        S2E["Image N → R_pred[N-1]"]
+    end
+
+    subgraph S3["③ 外参矩阵估计"]
+        S3A["{R_pred[0], ..., R_pred[N-1]}<br/>求均值 → SVD 正交化"]
+        S3B["R_extrinsic (3×3)<br/>A柱相机相对正视方向的安装偏置"]
+    end
+
+    subgraph S4["④ 批量补偿伪标签"]
+        S4A["对每帧预测:<br/>R_world = R_extrinsic.T @ R_pred<br/>或: pitch' = pitch - pitch_offset"]
+        S4B["补偿后伪标签 CSV<br/>Pitch ≈ 真实值 | Yaw 摆脱耦合"]
+    end
+
+    S1 --> S2
+    S2A --> S2B --> S3A
+    S2A --> S2C --> S3A
+    S2A --> S2D --> S3A
+    S2A --> S2E --> S3A
+    S3A --> S3B
+    S3B --> S4A
+    S4A --> S4B
+
+    style S1 fill:#28407c,stroke:#6699cc,color:#fff
+    style S2 fill:#326440,stroke:#6699cc,color:#fff
+    style S3 fill:#824028,stroke:#6699cc,color:#fff
+    style S4 fill:#463270,stroke:#6699cc,color:#fff
+    style S3B fill:#964020,stroke:#ffcc44,color:#fff
+    style S4B fill:#326428,stroke:#6699cc,color:#fff
